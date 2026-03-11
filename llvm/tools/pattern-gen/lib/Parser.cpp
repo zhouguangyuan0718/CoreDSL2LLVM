@@ -93,8 +93,10 @@ static void pop_var_scope() {
   scopeDepth--;
 }
 
+struct BehaviorStatement;
+
 void ParseScope(TokenStream &ts, llvm::Function *func,
-                llvm::IRBuilder<> &build);
+                llvm::IRBuilder<> &build, BehaviorStatement *ast = nullptr);
 Value ParseExpression(TokenStream &ts, llvm::Function *func,
                       llvm::IRBuilder<> &build, int minPrec = 0);
 
@@ -979,6 +981,49 @@ struct VarDef {
   bool sgn;
 };
 
+struct BehaviorExpression {
+  enum Kind {
+    Generic,
+    Assignment,
+    Index,
+  } kind = Generic;
+};
+
+struct BehaviorStatement {
+  enum Kind {
+    Scope,
+    If,
+    While,
+    For,
+    Declaration,
+    Expr,
+  } kind;
+  llvm::SmallVector<BehaviorStatement, 4> children;
+  llvm::SmallVector<BehaviorExpression, 4> expressions;
+};
+
+static BehaviorExpression classify_expression(TokenStream &ts,
+                                              llvm::Function *func,
+                                              llvm::IRBuilder<> &build) {
+  // Frontend placeholder classification: we still use the legacy expression
+  // backend today, but behavior parsing now has an explicit expression model
+  // that can be evolved independently.
+  BehaviorExpression expr;
+  size_t start = ts.i;
+  Value v = ParseExpression(ts, func, build);
+  size_t end = ts.i;
+  (void)v;
+
+  auto slice = ts.src.substr(start, end - start);
+  if (slice.find('[') != std::string::npos)
+    expr.kind = BehaviorExpression::Index;
+  if (slice.find("=") != std::string::npos &&
+      slice.find("==") == std::string::npos)
+    expr.kind = BehaviorExpression::Assignment;
+
+  return expr;
+}
+
 VarDef ParseDefinition(TokenStream &ts) {
   bool sgn = pop_cur_if(ts, SignedKeyword);
   if (!sgn)
@@ -1022,7 +1067,9 @@ VarDef ParseDefinition(TokenStream &ts) {
 }
 
 void ParseDeclaration(TokenStream &ts, llvm::Function *func,
-                      llvm::IRBuilder<> &build) {
+                      llvm::IRBuilder<> &build, BehaviorStatement *ast = nullptr) {
+  if (ast)
+    ast->kind = BehaviorStatement::Declaration;
   auto &ctx = func->getContext();
 
   auto [ident, identIdx, bitSize, sgn] = ParseDefinition(ts);
@@ -1062,11 +1109,13 @@ void ParseDeclaration(TokenStream &ts, llvm::Function *func,
 }
 
 void ParseStatement(TokenStream &ts, llvm::Function *func,
-                    llvm::IRBuilder<> &build) {
+                    llvm::IRBuilder<> &build, BehaviorStatement *ast) {
   auto &ctx = func->getContext();
 
   switch (ts.Peek().type) {
   case IfKeyword: {
+    if (ast)
+      ast->kind = BehaviorStatement::If;
     ts.Pop();
     pop_cur(ts, RBrOpen);
     Value cond = ParseExpression(ts, func, build);
@@ -1079,13 +1128,13 @@ void ParseStatement(TokenStream &ts, llvm::Function *func,
     build.CreateCondBr(condBool, bbTrue, bbFalse);
 
     build.SetInsertPoint(bbTrue);
-    ParseStatement(ts, func, build);
+    ParseStatement(ts, func, build, nullptr);
 
     if (pop_cur_if(ts, ElseKeyword)) {
       llvm::BasicBlock *bbCont = llvm::BasicBlock::Create(ctx, "", func);
       build.CreateBr(bbCont);
       build.SetInsertPoint(bbFalse);
-      ParseStatement(ts, func, build);
+      ParseStatement(ts, func, build, nullptr);
       build.CreateBr(bbCont);
       build.SetInsertPoint(bbCont);
     } else {
@@ -1096,18 +1145,22 @@ void ParseStatement(TokenStream &ts, llvm::Function *func,
   }
   case WhileKeyword:
   case ForKeyword: {
+    bool isFor = ts.Peek().type == ForKeyword;
+    if (ast)
+      ast->kind = isFor ? BehaviorStatement::For : BehaviorStatement::While;
+
     llvm::BasicBlock *bbHdr = llvm::BasicBlock::Create(ctx, "loop_hdr", func);
     llvm::BasicBlock *bbBody = llvm::BasicBlock::Create(ctx, "loop_body", func);
     llvm::BasicBlock *bbBreak =
         llvm::BasicBlock::Create(ctx, "loop_break", func);
     llvm::BasicBlock *bbInc = nullptr;
 
-    bool isFor = ts.Pop().type == ForKeyword;
+    ts.Pop();
     pop_cur(ts, RBrOpen);
     if (isFor) {
       create_var_scope();
       if (!pop_cur_if(ts, Semicolon))
-        ParseDeclaration(ts, func, build);
+        ParseDeclaration(ts, func, build, nullptr);
     }
 
     build.CreateBr(bbHdr);
@@ -1119,7 +1172,7 @@ void ParseStatement(TokenStream &ts, llvm::Function *func,
       pop_cur(ts, Semicolon);
       build.SetInsertPoint(bbInc);
       if (!pop_cur_if(ts, Semicolon))
-        ParseExpression(ts, func, build);
+        classify_expression(ts, func, build);
       build.CreateBr(bbHdr);
       build.SetInsertPoint(bbHdr);
     }
@@ -1130,7 +1183,7 @@ void ParseStatement(TokenStream &ts, llvm::Function *func,
     build.CreateCondBr(condBool, bbBreak, bbBody);
     build.SetInsertPoint(bbBody);
 
-    ParseStatement(ts, func, build);
+    ParseStatement(ts, func, build, nullptr);
 
     build.CreateBr(isFor ? bbInc : bbHdr);
     build.SetInsertPoint(bbBreak);
@@ -1141,14 +1194,18 @@ void ParseStatement(TokenStream &ts, llvm::Function *func,
   }
   case UnsignedKeyword:
   case SignedKeyword: {
-    ParseDeclaration(ts, func, build);
+    ParseDeclaration(ts, func, build, ast);
     break;
   }
   case CBrOpen:
-    ParseScope(ts, func, build);
+    ParseScope(ts, func, build, ast);
     break;
   default: {
-    ParseExpression(ts, func, build);
+    if (ast)
+      ast->kind = BehaviorStatement::Expr;
+    auto expr = classify_expression(ts, func, build);
+    if (ast)
+      ast->expressions.push_back(expr);
     pop_cur(ts, Semicolon);
     break;
   }
@@ -1156,12 +1213,14 @@ void ParseStatement(TokenStream &ts, llvm::Function *func,
 }
 
 void ParseScope(TokenStream &ts, llvm::Function *func,
-                llvm::IRBuilder<> &build) {
+                llvm::IRBuilder<> &build, BehaviorStatement *ast) {
+  if (ast)
+    ast->kind = BehaviorStatement::Scope;
   pop_cur(ts, CBrOpen);
   create_var_scope();
 
   while (ts.Peek().type != CBrClose)
-    ParseStatement(ts, func, build);
+    ParseStatement(ts, func, build, nullptr);
 
   pop_var_scope();
   pop_cur(ts, CBrClose);
@@ -1430,7 +1489,8 @@ void ParseBehaviour(TokenStream &ts, CDSLInstr &instr, llvm::Module *mod,
                             {cond});
     }
 
-  ParseStatement(ts, func, build);
+  BehaviorStatement behaviorAST{BehaviorStatement::Expr};
+  ParseStatement(ts, func, build, &behaviorAST);
   build.CreateRetVoid();
 }
 
