@@ -1360,8 +1360,32 @@ void ParseArguments(TokenStream &ts, CDSLInstr &instr) {
   pop_cur(ts, Semicolon);
 }
 
-void ParseBehaviour(TokenStream &ts, CDSLInstr &instr, llvm::Module *mod,
-                    Token const &ident) {
+void ParseBehaviour(TokenStream &ts, CDSLInstr &instr) {
+  pop_cur(ts, BehaviorKeyword);
+  pop_cur(ts, Colon);
+  instr.behaviorLine = ts.lineNumber;
+
+  int scopeDepth = 0;
+  while (ts.Peek().type != None) {
+    auto t = ts.Peek();
+    if (t.type == CBrClose && scopeDepth == 0)
+      break;
+
+    t = ts.Pop();
+    instr.behaviorTokens.push_back(t);
+
+    if (t.type == CBrOpen)
+      ++scopeDepth;
+    else if (t.type == CBrClose)
+      --scopeDepth;
+  }
+}
+
+static void GenerateInstructionBehaviorIR(CDSLInstr &instr, llvm::Module *mod) {
+  TokenStream ts(std::string("<behavior:") + instr.name + ">",
+                 std::vector<Token>(instr.behaviorTokens.begin(),
+                                    instr.behaviorTokens.end()),
+                 instr.behaviorLine);
   auto &ctx = mod->getContext();
   auto ptrT = llvm::PointerType::get(ctx, 0);
   auto immT = regT;
@@ -1397,20 +1421,13 @@ void ParseBehaviour(TokenStream &ts, CDSLInstr &instr, llvm::Module *mod,
   auto fType =
       llvm::FunctionType::get(llvm::Type::getVoidTy(ctx), argTypes, false);
 
-  pop_cur(ts, BehaviorKeyword);
-  pop_cur(ts, Colon);
-
   llvm::Function *func = llvm::Function::Create(
       fType, llvm::GlobalValue::ExternalLinkage,
-      std::string("impl") + std::string(ident.ident.str), mod);
+      std::string("impl") + instr.name, mod);
 
   for (size_t i = 0; i < argNames.size(); i++)
     func->getArg(i)->setName(argNames[i]);
 
-  // For vectorization to work, we must assume that
-  // the destination does not overlap with sources.
-  // For simulators using this generated code, this means
-  // that rd has to be a pointer to a temporary variable.
   for (size_t i = 0; i < curInstr->fields.size(); i++)
     if (curInstr->fields[i].type & CDSLInstr::OUT)
       func->getArg(i)->addAttr(llvm::Attribute::NoAlias);
@@ -1418,7 +1435,6 @@ void ParseBehaviour(TokenStream &ts, CDSLInstr &instr, llvm::Module *mod,
   entry = llvm::BasicBlock::Create(ctx, "", func);
   llvm::IRBuilder<> build(entry);
 
-  // Generate range assumes for immediates
   for (size_t i = 0; i < argBitLens.size(); i++)
     if (argBitLens[i] != -1) {
       auto *arg = func->getArg(i);
@@ -1431,15 +1447,13 @@ void ParseBehaviour(TokenStream &ts, CDSLInstr &instr, llvm::Module *mod,
     }
 
   ParseStatement(ts, func, build);
+  if (ts.Peek().type != None)
+    syntax_error(ts);
   build.CreateRetVoid();
 }
 
-std::vector<CDSLInstr> ParseCoreDSL2(TokenStream &ts, bool is64Bit,
-                                     llvm::Module *mod, bool NoExtend) {
+std::vector<CDSLInstr> ParseCoreDSL2FrontEnd(TokenStream &ts) {
   std::vector<CDSLInstr> instrs;
-  xlen = is64Bit ? 64 : 32;
-  NoExtend_ = NoExtend;
-  regT = llvm::Type::getIntNTy(mod->getContext(), xlen);
 
   while (ts.Peek().type != None) {
     bool parseBoilerplate =
@@ -1458,11 +1472,6 @@ std::vector<CDSLInstr> ParseCoreDSL2(TokenStream &ts, bool is64Bit,
     while (ts.Peek().type != CBrClose && ts.Peek().type != None) {
       reset_globals();
 
-      // add XLEN and RFS as constants for now.
-      add_variable(ts, ts.GetIdentIdx("XLEN"),
-                   Value{llvm::ConstantInt::get(regT, xlen)});
-      add_variable(ts, ts.GetIdentIdx("RFS"),
-                   Value{llvm::ConstantInt::get(regT, 32)});
       ++PatternGenNumInstructionsParsed;
 
       Token ident = pop_cur(ts, Identifier);
@@ -1474,7 +1483,7 @@ std::vector<CDSLInstr> ParseCoreDSL2(TokenStream &ts, bool is64Bit,
         ParseOperands(ts, instr);
       ParseEncoding(ts, instr);
       ParseArguments(ts, instr);
-      ParseBehaviour(ts, instr, mod, ident);
+      ParseBehaviour(ts, instr);
 
       pop_cur(ts, CBrClose);
       instrs.push_back(instr);
@@ -1486,4 +1495,24 @@ std::vector<CDSLInstr> ParseCoreDSL2(TokenStream &ts, bool is64Bit,
     }
   }
   return instrs;
+}
+
+void GenerateBehaviorIR(std::vector<CDSLInstr> &instrs, bool is64Bit,
+                        llvm::Module *mod, bool NoExtend) {
+  xlen = is64Bit ? 64 : 32;
+  NoExtend_ = NoExtend;
+  regT = llvm::Type::getIntNTy(mod->getContext(), xlen);
+
+  for (auto &instr : instrs) {
+    reset_globals();
+    curInstr = &instr;
+
+    TokenStream ts("<behavior-constants>", std::vector<Token>{}, instr.behaviorLine);
+    add_variable(ts, ts.GetIdentIdx("XLEN"),
+                 Value{llvm::ConstantInt::get(regT, xlen)});
+    add_variable(ts, ts.GetIdentIdx("RFS"),
+                 Value{llvm::ConstantInt::get(regT, 32)});
+
+    GenerateInstructionBehaviorIR(instr, mod);
+  }
 }

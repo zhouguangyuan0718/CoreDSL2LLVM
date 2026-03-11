@@ -2,6 +2,7 @@
 #include <string>
 #include <optional>
 #include <map>
+#include <vector>
 #include "Token.hpp"
 
 struct TokenStream
@@ -29,9 +30,12 @@ struct TokenStream
         std::make_pair("unsigned", UnsignedKeyword-TOK_KW_START),
     };
     const size_t NUM_KEYWORDS = strings.size();
+    std::optional<std::vector<Token>> replayTokens;
+    size_t replayIdx = 0;
 
   public:
     TokenStream (std::string&& srcPath);
+    TokenStream (std::string&& srcPath, std::vector<Token> &&tokens, int startLine = 1);
     Token Pop();
     Token Peek();
     unsigned GetIdentIdx(std::string_view ident);
