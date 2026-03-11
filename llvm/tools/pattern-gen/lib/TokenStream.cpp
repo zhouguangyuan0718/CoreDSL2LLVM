@@ -21,6 +21,13 @@ Token TokenStream::Pop()
         return t;
     }
 
+    if (replayTokens.has_value())
+    {
+        if (replayIdx >= replayTokens->size())
+            return Token(None);
+        return (*replayTokens)[replayIdx++];
+    }
+
     size_t len = src.length();
     const char* srcC = src.c_str();
 
@@ -212,3 +219,12 @@ std::string_view TokenStream::GetIdent(unsigned identIdx)
 }
 
 TokenStream::TokenStream(std::string&& srcPath) : path(srcPath), src(read_file_as_str(srcPath)) {}
+
+TokenStream::TokenStream(std::string&& srcPath, std::vector<Token> &&tokens,
+                         int startLine)
+    : path(srcPath), src(""), lineNumber(startLine),
+      replayTokens(std::move(tokens)) {
+  for (const auto &t : *replayTokens)
+    if (t.type == Identifier)
+      strings[t.ident.str] = t.ident.idx + NUM_KEYWORDS;
+}

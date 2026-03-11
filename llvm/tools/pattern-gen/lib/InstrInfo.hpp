@@ -1,5 +1,6 @@
 #pragma once
 #include "llvm/ADT/SmallVector.h"
+#include "Token.hpp"
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -44,6 +45,8 @@ struct CDSLInstr
 
     llvm::SmallVector<Field, 4> fields;
     llvm::SmallVector<FieldFrag, 8> frags;
+    llvm::SmallVector<Token, 64> behaviorTokens;
+    int behaviorLine = 1;
 };
 
 std::string EncodingToTablgen(CDSLInstr const& instr);

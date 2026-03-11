@@ -126,7 +126,8 @@ int main(int argc, char **argv) {
     TokenStream Ts(InputFilename.c_str());
     LLVMContext Ctx;
     auto Mod = std::make_unique<Module>("mod", Ctx);
-    auto Instrs = ParseCoreDSL2(Ts, (XLen == 64), Mod.get(), NoExtend);
+    auto Instrs = ParseCoreDSL2FrontEnd(Ts);
+    GenerateBehaviorIR(Instrs, (XLen == 64), Mod.get(), NoExtend);
 
     if (irOut) {
       std::string Str;
